@@ -3,26 +3,27 @@
 require 'rubygems'
 require 'xmpp4r'
 require 'xmpp4r/roster'
+require 'xmpp4r/muc'
 require 'yaml'
 
 class BotBase
   
-  def initialize(username, password, status="I am a bot")
+  def initialize(username, password, status="I am a bot", host=nil)
     @commands = {}
     
-    @friends_sent_to = []
+    @friends_sent_to = [@jid]
     @friends_online = {}
     @state = nil
     @mainthread = Thread.current
-    @itunes = OSA.app('itunes')
     @ic = Iconv.new('UTF-8//IGNORE', 'UTF-8')
     @last_message = nil
+    @jid    = Jabber::JID.new(username)
+    @subscribers = [@jid]
     
     load_commands
     
-    login(username, password)
+    login(password, host)
 
-    listen_for_subscription_requests
     listen_for_messages
 
     send_initial_presence(status)
@@ -50,10 +51,9 @@ class BotBase
     end
   end
 
-  def login(username, password)
-    @jid    = Jabber::JID.new(username)
+  def login(password, host = nil)
     @client = Jabber::Client.new(@jid)
-    @client.connect
+    @client.connect(host)
     @client.auth(password)
   end
   
@@ -69,20 +69,9 @@ class BotBase
   def send_initial_presence(status)
     @client.send(Jabber::Presence.new.set_status(status))
   end
-
-  def listen_for_subscription_requests
-    @roster   = Jabber::Roster::Helper.new(@client)
-
-    @roster.add_subscription_request_callback do |item, pres|
-      if pres.from.domain == @jid.domain
-        log "ACCEPTING AUTHORIZATION REQUEST FROM: " + pres.from.to_s
-        @roster.accept_subscription(pres.from)
-      end
-    end
-  end
   
-  def send_message_to(incoming, outgoing)
-    msg      = Jabber::Message.new(incoming.from, escape( outgoing ))
+  def send_message_to(from, outgoing)
+    msg      = Jabber::Message.new(from, escape( outgoing ))
     msg.type = :chat
     @client.send(msg)
   end
@@ -90,20 +79,21 @@ class BotBase
   def reload_commands(m)
     @commands = {}
     output = load_commands
-    send_message_to(m, "#{output} #{@commands.inspect}")
+    send_message_to(m.from, "#{output} #{@commands.inspect}")
   end
 
   def listen_for_messages
     @client.add_message_callback do |m|
       if m.type != :error && @state == nil
         if !@friends_sent_to.include?(m.from)
-          send_message_to(m, "Hello. I am robot. You are connecting for the first time.")
+          send_message_to(m.from, "Hello I'm a chatroom bot. If you'd like to enter my room say '!enter!'.")
           @friends_sent_to << m.from
-        end
-        if m.body == 'reload!'
-          self.reload_commands(m)
+        elsif /^\!(.*)\!$/.match(m.body)
+          run_command($1, m)
+        elsif @subscribers.include?(m.from)
+          send_group_chat(m)
         else
-          send_message_to(m, response_to( m.body ) )
+          send_message_to(m.from, "You need to enter the room to chat. Say '!enter!' to enter the room.")
         end
       end
     end
@@ -118,6 +108,35 @@ class BotBase
       when :unavailable
         log "PRESENCE: #{m.from.to_short_s} is offline"
         @friends_online[m.from.to_short_s] = false
+      end
+    end
+  end 
+  
+  def run_command(text, m)
+    if text == 'reload'
+      self.reload_commands(m)
+    elsif text == 'enter'
+      if !@subscribers.include?(m.from)
+        send_message_to(m.from, "Welcome to this chat room. If you'd like to leave say '!leave!' ")
+        send_group_chat(m, "#{m.from.node} has entered")
+        @subscribers << m.from
+      else
+        send_message_to(m.from, "You're already in this room :-)")
+      end
+    elsif text == 'leave'
+      @subscribers.delete(m.from)
+      send_group_chat(m, "#{m.from.node} has left.")
+      send_message_to(m.from, "You have left the chat room.")
+    else
+      send_message_to(m.from, response_to( text ) )
+    end
+  end
+  
+  def send_group_chat(m, text = nil)
+    message = text ? text : "#{m.from.node}: #{m.body}"
+    @subscribers.each do |f|
+      unless f == m.from
+        send_message_to(f, message)
       end
     end
   end
